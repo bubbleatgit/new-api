@@ -1,0 +1,76 @@
+name: new-api-local-test
+
+services:
+  new-api:
+    image: new-api:local-test
+    container_name: new-api-local-test
+    restart: unless-stopped
+    command: --log-dir /app/logs
+    ports:
+      - "3001:3000"
+    volumes:
+      - ./data/new-api:/data
+      - ./logs/new-api:/app/logs
+    environment:
+      SQL_DSN: postgresql://newapi:local_test_password@postgres:5432/newapi
+      REDIS_CONN_STRING: redis://:local_test_redis@redis:6379
+      TZ: Asia/Shanghai
+      ERROR_LOG_ENABLED: "true"
+      BATCH_UPDATE_ENABLED: "true"
+      NODE_NAME: local-test
+      SESSION_SECRET: local-test-session-secret-change-me
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - new-api-local
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:3000/api/status | grep -o '\"success\":\\s*true' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  postgres:
+    image: postgres:15
+    container_name: new-api-local-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: newapi
+      POSTGRES_PASSWORD: local_test_password
+      POSTGRES_DB: newapi
+      TZ: Asia/Shanghai
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - new-api-local
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U newapi -d newapi"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7
+    container_name: new-api-local-redis
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "local_test_redis"]
+    volumes:
+      - redis_data:/data
+    networks:
+      - new-api-local
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a local_test_redis ping | grep PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  new-api-local:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
