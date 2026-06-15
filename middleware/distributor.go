@@ -482,10 +482,47 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 		c.Set("api_version", channel.Other)
 	case constant.ChannelTypeMokaAI:
 		c.Set("api_version", channel.Other)
+		case constant.ChannelTypeCoze:
+			c.Set("bot_id", channel.Other)
+		}
+		return nil
+}
+
+// SetupContextForForcedKey 在已强制选定 key 后，补做 SetupContextForSelectedChannel 因选 key 失败短路而跳过的 context 设置。
+// 仅用于探活强制测试指定 key（包括被禁用的 key）的场景，不影响 relay 主分发路径。
+func SetupContextForForcedKey(c *gin.Context, channel *model.Channel, key string, keyIndex int) {
+	if channel.ChannelInfo.IsMultiKey {
+		common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, true)
+		common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, keyIndex)
+	} else {
+		// 必须设置为 false，否则在重试到单个 key 的时候会导致日志显示错误
+		common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, false)
+	}
+	// c.Request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", key))
+	common.SetContextKey(c, constant.ContextKeyChannelKey, key)
+	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, channel.GetBaseURL())
+
+	common.SetContextKey(c, constant.ContextKeySystemPromptOverride, false)
+
+	// TODO: api_version统一
+	switch channel.Type {
+	case constant.ChannelTypeAzure:
+		c.Set("api_version", channel.Other)
+	case constant.ChannelTypeVertexAi:
+		c.Set("region", channel.Other)
+	case constant.ChannelTypeXunfei:
+		c.Set("api_version", channel.Other)
+	case constant.ChannelTypeGemini:
+		c.Set("api_version", channel.Other)
+	case constant.ChannelTypeAli:
+		c.Set("plugin", channel.Other)
+	case constant.ChannelCloudflare:
+		c.Set("api_version", channel.Other)
+	case constant.ChannelTypeMokaAI:
+		c.Set("api_version", channel.Other)
 	case constant.ChannelTypeCoze:
 		c.Set("bot_id", channel.Other)
 	}
-	return nil
 }
 
 // extractModelNameFromGeminiPath 从 Gemini API URL 路径中提取模型名

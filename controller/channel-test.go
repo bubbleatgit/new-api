@@ -74,7 +74,11 @@ func resolveChannelTestUserID(c *gin.Context) (int, error) {
 	return rootUser.Id, nil
 }
 
-func testChannel(channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool) testResult {
+// testChannel 对渠道执行一次探活测试。
+// forceKeyIndex < 0 表示不强制选 key，走原有 GetNextEnabledKey 逻辑；
+// forceKeyIndex >= 0 表示强制使用多 key 渠道中的第 forceKeyIndex 个 key（即使该 key 已被禁用），
+// 用于探活自动恢复被禁用的 key。
+func testChannel(channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool, forceKeyIndex int) testResult {
 	tik := time.Now()
 	var unsupportedTestChannelTypes = []int{
 		constant.ChannelTypeMidjourney,
@@ -179,11 +183,25 @@ func testChannel(channel *model.Channel, testUserID int, testModel string, endpo
 
 	newAPIError := middleware.SetupContextForSelectedChannel(c, channel, testModel)
 	if newAPIError != nil {
-		return testResult{
-			context:     c,
-			localErr:    newAPIError,
-			newAPIError: newAPIError,
+		// 当强制指定 key 时，容忍 "no enabled keys" 错误（全部 key 被禁用的情况），
+		// 改为手动写入指定的 key/index 并补做后续 context 设置，让探活能测到被禁用的 key。
+		if forceKeyIndex < 0 || !channel.ChannelInfo.IsMultiKey {
+			return testResult{
+				context:     c,
+				localErr:    newAPIError,
+				newAPIError: newAPIError,
+			}
 		}
+		keys := channel.GetKeys()
+		if forceKeyIndex >= len(keys) {
+			return testResult{
+				context:     c,
+				localErr:    fmt.Errorf("force key index %d out of range (len=%d)", forceKeyIndex, len(keys)),
+				newAPIError: types.NewError(fmt.Errorf("force key index %d out of range (len=%d)", forceKeyIndex, len(keys)), types.ErrorCodeInvalidApiType),
+			}
+		}
+		// 补做 SetupContextForSelectedChannel 因选 key 失败短路而跳过的剩余 context 设置
+		middleware.SetupContextForForcedKey(c, channel, keys[forceKeyIndex], forceKeyIndex)
 	}
 
 	// Determine relay format based on endpoint type or request path
@@ -851,13 +869,21 @@ func TestChannel(c *gin.Context) {
 	testModel := c.Query("model")
 	endpointType := c.Query("endpoint_type")
 	isStream, _ := strconv.ParseBool(c.Query("stream"))
+	// key_index 可选：指定要测试的多 key 渠道中的第 N 个 key（从 0 开始），便于手动测试/恢复单个被禁用的 key。
+	// 不传时为 -1，走原有自动选 key 逻辑。
+	forceKeyIndex := -1
+	if v := c.Query("key_index"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			forceKeyIndex = i
+		}
+	}
 	testUserID, err := resolveChannelTestUserID(c)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
 	tik := time.Now()
-	result := testChannel(channel, testUserID, testModel, endpointType, isStream)
+	result := testChannel(channel, testUserID, testModel, endpointType, isStream, forceKeyIndex)
 	if result.localErr != nil {
 		resp := gin.H{
 			"success": false,
@@ -927,39 +953,33 @@ func testAllChannels(notify bool) error {
 				continue
 			}
 			isChannelEnabled := channel.Status == common.ChannelStatusEnabled
-			tik := time.Now()
-			result := testChannel(channel, testUserID, "", "", shouldUseStreamForAutomaticChannelTest(channel))
-			tok := time.Now()
-			milliseconds := tok.Sub(tik).Milliseconds()
 
-			shouldBanChannel := false
-			newAPIError := result.newAPIError
-			// request error disables the channel
-			if newAPIError != nil {
-				shouldBanChannel = service.ShouldDisableChannel(result.newAPIError)
+			if !channel.ChannelInfo.IsMultiKey {
+				// 单 key 渠道：保持原有逻辑，测一次
+				testChannelOnce(channel, testUserID, -1, isChannelEnabled, disableThreshold)
+				continue
 			}
 
-			// 当错误检查通过，才检查响应时间
-			if common.AutomaticDisableChannelEnabled && !shouldBanChannel {
-				if milliseconds > disableThreshold {
-					err := fmt.Errorf("响应时间 %.2fs 超过阈值 %.2fs", float64(milliseconds)/1000.0, float64(disableThreshold)/1000.0)
-					newAPIError = types.NewOpenAIError(err, types.ErrorCodeChannelResponseTimeExceeded, http.StatusRequestTimeout)
-					shouldBanChannel = true
+			// 多 key 渠道：遍历所有 key 逐个探测。
+			// enabled 的 key 仍走“失败则禁用”逻辑；
+			// 被禁用的 key 也要探测，成功则恢复（打通单 key 级别的自动恢复）。
+			keys := channel.GetKeys()
+			for idx := range keys {
+				// 每个 key 都重新读取最新渠道状态，避免循环内禁用/启用导致状态过时
+				freshChannel, err := model.CacheGetChannel(channel.Id)
+				if err != nil {
+					freshChannel, err = model.GetChannelById(channel.Id, true)
+					if err != nil {
+						common.SysError(fmt.Sprintf("testAllChannels: failed to refresh channel #%d: %v", channel.Id, err))
+						break
+					}
 				}
+				if freshChannel.Status == common.ChannelStatusManuallyDisabled {
+					break // 渠道在过程中被手动禁用，停止测试剩余 key
+				}
+				freshEnabled := freshChannel.Status == common.ChannelStatusEnabled
+				testChannelOnce(freshChannel, testUserID, idx, freshEnabled, disableThreshold)
 			}
-
-			// disable channel
-			if isChannelEnabled && shouldBanChannel && channel.GetAutoBan() {
-				processChannelError(result.context, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(result.context, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
-			}
-
-			// enable channel
-			if !isChannelEnabled && service.ShouldEnableChannel(newAPIError, channel.Status) {
-				service.EnableChannel(channel.Id, common.GetContextKeyString(result.context, constant.ContextKeyChannelKey), channel.Name)
-			}
-
-			channel.UpdateResponseTime(milliseconds)
-			time.Sleep(common.RequestInterval)
 		}
 
 		if notify {
@@ -967,6 +987,73 @@ func testAllChannels(notify bool) error {
 		}
 	})
 	return nil
+}
+
+// testChannelOnce 执行一次渠道探活，并根据结果执行禁用/启用判定。
+// shouldEnableAfterTest 判定一次探活结束后是否应当调用 EnableChannel 恢复（渠道或单个 key）。
+//
+// - 多 key 逐 key 探测路径（forceKeyIndex >= 0）：只要本次探测成功且开启了自动启用，且有实际使用的 key，
+//   就尝试恢复该 key。此时渠道整体状态可能仍是 Enabled（部分 key 挂掉的场景），
+//   service.ShouldEnableChannel 会因 status != AutoDisabled 返回 false 而漏掉单 key 恢复，
+//   因此这里单独判定，打通“被禁用的 key 探测成功后自动恢复”的链路。
+// - 单 key 路径（forceKeyIndex < 0）：沿用原有恢复判定——仅在渠道整体被自动禁用（AutoDisabled）
+//   且本次探测成功时才恢复。
+//
+// 抽成纯函数便于对这一关键决策做单测覆盖。
+func shouldEnableAfterTest(forceKeyIndex int, isChannelEnabled bool, channelStatus int, newAPIError *types.NewAPIError, usingKey string) bool {
+	if !common.AutomaticEnableChannelEnabled {
+		return false
+	}
+	if forceKeyIndex >= 0 {
+		// 多 key 逐 key 路径：本次探测成功且能定位到具体 key，即可恢复该 key
+		return newAPIError == nil && usingKey != ""
+	}
+	// 单 key 路径：渠道整体未启用、且符合 ShouldEnableChannel 条件（status==AutoDisabled 且本次成功）
+	if isChannelEnabled {
+		return false
+	}
+	return service.ShouldEnableChannel(newAPIError, channelStatus)
+}
+
+// testChannelOnce 执行一次渠道探活，并根据结果执行禁用/启用判定。
+// forceKeyIndex < 0：单 key 渠道或自动选 key（走原有逻辑）；forceKeyIndex >= 0：强制测试多 key 渠道中的指定 key。
+// isChannelEnabled 为本次测试前渠道的整体状态。
+func testChannelOnce(channel *model.Channel, testUserID int, forceKeyIndex int, isChannelEnabled bool, disableThreshold int64) {
+	tik := time.Now()
+	result := testChannel(channel, testUserID, "", "", shouldUseStreamForAutomaticChannelTest(channel), forceKeyIndex)
+	tok := time.Now()
+	milliseconds := tok.Sub(tik).Milliseconds()
+
+	shouldBanChannel := false
+	newAPIError := result.newAPIError
+	// request error disables the channel
+	if newAPIError != nil {
+		shouldBanChannel = service.ShouldDisableChannel(result.newAPIError)
+	}
+
+	// 当错误检查通过，才检查响应时间
+	if common.AutomaticDisableChannelEnabled && !shouldBanChannel {
+		if milliseconds > disableThreshold {
+			err := fmt.Errorf("响应时间 %.2fs 超过阈值 %.2fs", float64(milliseconds)/1000.0, float64(disableThreshold)/1000.0)
+			newAPIError = types.NewOpenAIError(err, types.ErrorCodeChannelResponseTimeExceeded, http.StatusRequestTimeout)
+			shouldBanChannel = true
+		}
+	}
+
+	usingKey := common.GetContextKeyString(result.context, constant.ContextKeyChannelKey)
+
+	// disable channel（单 key / 多 key 通用）
+	if isChannelEnabled && shouldBanChannel && channel.GetAutoBan() {
+		processChannelError(result.context, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, usingKey, channel.GetAutoBan()), newAPIError)
+	}
+
+	// enable channel
+	if shouldEnableAfterTest(forceKeyIndex, isChannelEnabled, channel.Status, newAPIError, usingKey) {
+		service.EnableChannel(channel.Id, usingKey, channel.Name)
+	}
+
+	channel.UpdateResponseTime(milliseconds)
+	time.Sleep(common.RequestInterval)
 }
 
 func TestAllChannels(c *gin.Context) {
