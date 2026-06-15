@@ -961,8 +961,9 @@ func testAllChannels(notify bool) error {
 			}
 
 			// 多 key 渠道：遍历所有 key 逐个探测。
-			// enabled 的 key 仍走“失败则禁用”逻辑；
-			// 被禁用的 key 也要探测，成功则恢复（打通单 key 级别的自动恢复）。
+			// - 启用的 key：探测，失败则按规则禁用（原逻辑）
+			// - 自动禁用的 key（status==3）：探测，成功则恢复
+			// - 手动禁用的 key（status==2）：跳过，绝不自动恢复（尊重手动操作）
 			keys := channel.GetKeys()
 			for idx := range keys {
 				// 每个 key 都重新读取最新渠道状态，避免循环内禁用/启用导致状态过时
@@ -977,6 +978,9 @@ func testAllChannels(notify bool) error {
 				if freshChannel.Status == common.ChannelStatusManuallyDisabled {
 					break // 渠道在过程中被手动禁用，停止测试剩余 key
 				}
+				if !shouldProbeMultiKey(freshChannel, idx) {
+					continue // 手动禁用的 key 不参与探活
+				}
 				freshEnabled := freshChannel.Status == common.ChannelStatusEnabled
 				testChannelOnce(freshChannel, testUserID, idx, freshEnabled, disableThreshold)
 			}
@@ -990,6 +994,26 @@ func testAllChannels(notify bool) error {
 }
 
 // testChannelOnce 执行一次渠道探活，并根据结果执行禁用/启用判定。
+// shouldProbeMultiKey 判定多 key 渠道中第 keyIndex 个 key 是否应当参与探活。
+//
+// 语义：
+//   - 启用的 key（不在 MultiKeyStatusList 中，或值为 Enabled）：参与探活，失败可禁用。
+//   - 自动禁用的 key（值为 ChannelStatusAutoDisabled）：参与探活，成功则恢复。
+//   - 手动禁用的 key（值为 ChannelStatusManuallyDisabled）：跳过，绝不自动探测/恢复。
+//
+// 这是修复“手动禁用的 key 被探活误恢复”的关键过滤：探活只服务于自动禁用的恢复，
+// 尊重用户的显式手动禁用决策。
+func shouldProbeMultiKey(channel *model.Channel, keyIndex int) bool {
+	if channel.ChannelInfo.MultiKeyStatusList == nil {
+		return true // 无状态记录，视为启用，参与探活
+	}
+	status, exists := channel.ChannelInfo.MultiKeyStatusList[keyIndex]
+	if !exists {
+		return true // 未记录 = 启用
+	}
+	return status != common.ChannelStatusManuallyDisabled // 手动禁用跳过，其它(启用/自动禁用)参与
+}
+
 // shouldEnableAfterTest 判定一次探活结束后是否应当调用 EnableChannel 恢复（渠道或单个 key）。
 //
 // - 多 key 逐 key 探测路径（forceKeyIndex >= 0）：只要本次探测成功且开启了自动启用，且有实际使用的 key，
