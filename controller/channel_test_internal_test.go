@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -82,6 +83,159 @@ func TestResolveChannelTestUserIDUsesRequestUser(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Equal(t, 2, userID)
+}
+
+func TestShouldProbeMultiKey(t *testing.T) {
+	cases := []struct {
+		name       string
+		statusList map[int]int
+		keyIndex   int
+		want       bool
+	}{
+		{
+			name:       "nil status list -> probe",
+			statusList: nil,
+			keyIndex:   0,
+			want:       true,
+		},
+		{
+			name:       "key not in list -> probe",
+			statusList: map[int]int{1: common.ChannelStatusAutoDisabled},
+			keyIndex:   0,
+			want:       true,
+		},
+		{
+			name:       "manual disabled key -> skip",
+			statusList: map[int]int{0: common.ChannelStatusManuallyDisabled},
+			keyIndex:   0,
+			want:       false,
+		},
+		{
+			name:       "auto disabled key -> probe",
+			statusList: map[int]int{0: common.ChannelStatusAutoDisabled},
+			keyIndex:   0,
+			want:       true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ch := &model.Channel{
+				ChannelInfo: model.ChannelInfo{
+					IsMultiKey:         true,
+					MultiKeyStatusList: tc.statusList,
+				},
+			}
+			require.Equal(t, tc.want, shouldProbeMultiKey(ch, tc.keyIndex))
+		})
+	}
+}
+
+func TestShouldEnableAfterTest(t *testing.T) {
+	orig := common.AutomaticEnableChannelEnabled
+	t.Cleanup(func() { common.AutomaticEnableChannelEnabled = orig })
+
+	someErr := types.NewOpenAIError(
+		fmt.Errorf("boom"),
+		types.ErrorCodeBadResponse,
+		http.StatusInternalServerError,
+	)
+
+	cases := []struct {
+		name          string
+		enableSwitch  bool
+		forceKeyIndex int
+		isChannelOn   bool
+		channelStatus int
+		keyStatusList map[int]int
+		err           *types.NewAPIError
+		usingKey      string
+		want          bool
+	}{
+		{
+			name:          "switch off blocks multi-key success",
+			enableSwitch:  false,
+			forceKeyIndex: 0,
+			isChannelOn:   true,
+			channelStatus: common.ChannelStatusEnabled,
+			keyStatusList: map[int]int{0: common.ChannelStatusAutoDisabled},
+			usingKey:      "k1",
+			want:          false,
+		},
+		{
+			name:          "multi-key auto disabled key success -> recover",
+			enableSwitch:  true,
+			forceKeyIndex: 0,
+			isChannelOn:   true,
+			channelStatus: common.ChannelStatusEnabled,
+			keyStatusList: map[int]int{0: common.ChannelStatusAutoDisabled},
+			usingKey:      "k1",
+			want:          true,
+		},
+		{
+			name:          "multi-key probe failed -> no recover",
+			enableSwitch:  true,
+			forceKeyIndex: 1,
+			isChannelOn:   true,
+			channelStatus: common.ChannelStatusEnabled,
+			keyStatusList: map[int]int{1: common.ChannelStatusAutoDisabled},
+			err:           someErr,
+			usingKey:      "k2",
+			want:          false,
+		},
+		{
+			name:          "multi-key enabled key success -> no recover notification",
+			enableSwitch:  true,
+			forceKeyIndex: 0,
+			isChannelOn:   true,
+			channelStatus: common.ChannelStatusEnabled,
+			keyStatusList: nil,
+			usingKey:      "k1",
+			want:          false,
+		},
+		{
+			name:          "multi-key manual disabled key success -> no recover",
+			enableSwitch:  true,
+			forceKeyIndex: 0,
+			isChannelOn:   true,
+			channelStatus: common.ChannelStatusEnabled,
+			keyStatusList: map[int]int{0: common.ChannelStatusManuallyDisabled},
+			usingKey:      "k1",
+			want:          false,
+		},
+		{
+			name:          "single-key auto disabled success -> recover",
+			enableSwitch:  true,
+			forceKeyIndex: -1,
+			isChannelOn:   false,
+			channelStatus: common.ChannelStatusAutoDisabled,
+			usingKey:      "only-key",
+			want:          true,
+		},
+		{
+			name:          "single-key manual disabled never recovers",
+			enableSwitch:  true,
+			forceKeyIndex: -1,
+			isChannelOn:   false,
+			channelStatus: common.ChannelStatusManuallyDisabled,
+			usingKey:      "only-key",
+			want:          false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			common.AutomaticEnableChannelEnabled = tc.enableSwitch
+			channel := &model.Channel{
+				ChannelInfo: model.ChannelInfo{
+					IsMultiKey:         tc.forceKeyIndex >= 0,
+					MultiKeyStatusList: tc.keyStatusList,
+				},
+			}
+			got := shouldEnableAfterTest(channel, tc.forceKeyIndex, tc.isChannelOn, tc.channelStatus, tc.err, tc.usingKey)
+			require.Equal(t, tc.want, got)
+		})
+	}
 }
 
 func TestSelectChannelsForAutomaticTestPassiveRecoveryOnlyUsesAutoDisabled(t *testing.T) {

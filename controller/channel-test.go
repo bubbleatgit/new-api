@@ -72,7 +72,7 @@ func resolveChannelTestUserID(c *gin.Context) (int, error) {
 	return rootUser.Id, nil
 }
 
-func testChannel(ctx context.Context, channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool) testResult {
+func testChannel(ctx context.Context, channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool, forceKeyIndex int) testResult {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -173,7 +173,21 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	group, _ := model.GetUserGroup(testUserID, false)
 	c.Set("group", group)
 
-	newAPIError := middleware.SetupContextForSelectedChannel(c, channel, testModel)
+	var newAPIError *types.NewAPIError
+	if forceKeyIndex >= 0 && channel.ChannelInfo.IsMultiKey {
+		keys := channel.GetKeys()
+		if forceKeyIndex >= len(keys) {
+			err := fmt.Errorf("force key index %d out of range (len=%d)", forceKeyIndex, len(keys))
+			return testResult{
+				context:     c,
+				localErr:    err,
+				newAPIError: types.NewError(err, types.ErrorCodeInvalidApiType),
+			}
+		}
+		newAPIError = middleware.SetupContextForForcedChannelKey(c, channel, testModel, keys[forceKeyIndex], forceKeyIndex)
+	} else {
+		newAPIError = middleware.SetupContextForSelectedChannel(c, channel, testModel)
+	}
 	if newAPIError != nil {
 		return testResult{
 			context:     c,
@@ -847,6 +861,12 @@ func TestChannel(c *gin.Context) {
 	testModel := c.Query("model")
 	endpointType := c.Query("endpoint_type")
 	isStream, _ := strconv.ParseBool(c.Query("stream"))
+	forceKeyIndex := -1
+	if v := c.Query("key_index"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			forceKeyIndex = i
+		}
+	}
 	testUserID, err := resolveChannelTestUserID(c)
 	if err != nil {
 		common.ApiError(c, err)
@@ -857,7 +877,7 @@ func TestChannel(c *gin.Context) {
 	if c.Request != nil {
 		requestCtx = c.Request.Context()
 	}
-	result := testChannel(requestCtx, channel, testUserID, testModel, endpointType, isStream)
+	result := testChannel(requestCtx, channel, testUserID, testModel, endpointType, isStream, forceKeyIndex)
 	if result.localErr != nil {
 		resp := gin.H{
 			"success": false,
@@ -922,66 +942,136 @@ func performChannelTests(ctx context.Context, channels []*model.Channel, testUse
 		if channel.Status == common.ChannelStatusManuallyDisabled {
 			continue
 		}
-		isChannelEnabled := channel.Status == common.ChannelStatusEnabled
-		tik := time.Now()
-		result := testChannel(ctx, channel, testUserID, "", "", shouldUseStreamForAutomaticChannelTest(channel))
-		tok := time.Now()
-		milliseconds := tok.Sub(tik).Milliseconds()
-		if ctx != nil && ctx.Err() != nil {
-			break
+		if !channel.ChannelInfo.IsMultiKey {
+			mergeChannelTestSummary(&summary, testChannelOnce(ctx, channel, testUserID, -1, channel.Status == common.ChannelStatusEnabled, disableThreshold, allowDisable))
+			continue
 		}
 
-		summary.Tested++
-
-		shouldBanChannel := false
-		newAPIError := result.newAPIError
-		// request error disables the channel
-		if newAPIError != nil {
-			shouldBanChannel = service.ShouldDisableChannel(result.newAPIError)
-		}
-
-		// 当错误检查通过，才检查响应时间
-		if common.AutomaticDisableChannelEnabled && !shouldBanChannel {
-			if milliseconds > disableThreshold {
-				err := fmt.Errorf("响应时间 %.2fs 超过阈值 %.2fs", float64(milliseconds)/1000.0, float64(disableThreshold)/1000.0)
-				newAPIError = types.NewOpenAIError(err, types.ErrorCodeChannelResponseTimeExceeded, http.StatusRequestTimeout)
-				shouldBanChannel = true
+		keys := channel.GetKeys()
+		for idx := range keys {
+			if ctx != nil && ctx.Err() != nil {
+				return summary
 			}
-		}
-
-		if newAPIError == nil {
-			summary.Succeeded++
-		} else {
-			summary.Failed++
-		}
-
-		// disable channel
-		if allowDisable && isChannelEnabled && shouldBanChannel && channel.GetAutoBan() {
-			processChannelError(result.context, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(result.context, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
-			summary.Disabled++
-		}
-
-		// enable channel
-		if result.localErr == nil && !isChannelEnabled && service.ShouldEnableChannel(newAPIError, channel.Status) {
-			service.EnableChannel(channel.Id, common.GetContextKeyString(result.context, constant.ContextKeyChannelKey), channel.Name)
-			summary.Enabled++
-		}
-
-		channel.UpdateResponseTime(milliseconds)
-		if common.RequestInterval > 0 {
-			if ctx == nil {
-				time.Sleep(common.RequestInterval)
-			} else {
-				select {
-				case <-ctx.Done():
-					return summary
-				case <-time.After(common.RequestInterval):
+			freshChannel, err := model.CacheGetChannel(channel.Id)
+			if err != nil {
+				freshChannel, err = model.GetChannelById(channel.Id, true)
+				if err != nil {
+					common.SysError(fmt.Sprintf("performChannelTests: failed to refresh channel #%d: %v", channel.Id, err))
+					break
 				}
 			}
+			if freshChannel.Status == common.ChannelStatusManuallyDisabled {
+				break
+			}
+			if !shouldProbeMultiKey(freshChannel, idx) {
+				continue
+			}
+			mergeChannelTestSummary(&summary, testChannelOnce(ctx, freshChannel, testUserID, idx, freshChannel.Status == common.ChannelStatusEnabled, disableThreshold, allowDisable))
 		}
 	}
 	if report != nil && (ctx == nil || ctx.Err() == nil) {
 		report(total, total) // mark complete only when the full set was tested
+	}
+	return summary
+}
+
+func mergeChannelTestSummary(dst *channelTestSummary, src channelTestSummary) {
+	dst.Tested += src.Tested
+	dst.Succeeded += src.Succeeded
+	dst.Failed += src.Failed
+	dst.Disabled += src.Disabled
+	dst.Enabled += src.Enabled
+}
+
+func shouldProbeMultiKey(channel *model.Channel, keyIndex int) bool {
+	if channel.ChannelInfo.MultiKeyStatusList == nil {
+		return true
+	}
+	status, exists := channel.ChannelInfo.MultiKeyStatusList[keyIndex]
+	if !exists {
+		return true
+	}
+	return status != common.ChannelStatusManuallyDisabled
+}
+
+func shouldEnableAfterTest(channel *model.Channel, forceKeyIndex int, isChannelEnabled bool, channelStatus int, newAPIError *types.NewAPIError, usingKey string) bool {
+	if !common.AutomaticEnableChannelEnabled {
+		return false
+	}
+	if forceKeyIndex >= 0 {
+		return newAPIError == nil && usingKey != "" && isMultiKeyAutoDisabled(channel, forceKeyIndex)
+	}
+	if isChannelEnabled {
+		return false
+	}
+	return service.ShouldEnableChannel(newAPIError, channelStatus)
+}
+
+func isMultiKeyAutoDisabled(channel *model.Channel, keyIndex int) bool {
+	if channel == nil || !channel.ChannelInfo.IsMultiKey || channel.ChannelInfo.MultiKeyStatusList == nil {
+		return false
+	}
+	status, ok := channel.ChannelInfo.MultiKeyStatusList[keyIndex]
+	return ok && status == common.ChannelStatusAutoDisabled
+}
+
+func testChannelOnce(ctx context.Context, channel *model.Channel, testUserID int, forceKeyIndex int, isChannelEnabled bool, disableThreshold int64, allowDisable bool) channelTestSummary {
+	summary := channelTestSummary{}
+	tik := time.Now()
+	result := testChannel(ctx, channel, testUserID, "", "", shouldUseStreamForAutomaticChannelTest(channel), forceKeyIndex)
+	tok := time.Now()
+	milliseconds := tok.Sub(tik).Milliseconds()
+	if ctx != nil && ctx.Err() != nil {
+		return summary
+	}
+
+	summary.Tested++
+
+	shouldBanChannel := false
+	newAPIError := result.newAPIError
+	if newAPIError != nil {
+		shouldBanChannel = service.ShouldDisableChannel(result.newAPIError)
+	}
+
+	if common.AutomaticDisableChannelEnabled && !shouldBanChannel {
+		if milliseconds > disableThreshold {
+			err := fmt.Errorf("响应时间 %.2fs 超过阈值 %.2fs", float64(milliseconds)/1000.0, float64(disableThreshold)/1000.0)
+			newAPIError = types.NewOpenAIError(err, types.ErrorCodeChannelResponseTimeExceeded, http.StatusRequestTimeout)
+			shouldBanChannel = true
+		}
+	}
+
+	if newAPIError == nil {
+		summary.Succeeded++
+	} else {
+		summary.Failed++
+	}
+
+	usingKey := ""
+	if result.context != nil {
+		usingKey = common.GetContextKeyString(result.context, constant.ContextKeyChannelKey)
+	}
+
+	if allowDisable && result.context != nil && isChannelEnabled && shouldBanChannel && channel.GetAutoBan() {
+		processChannelError(result.context, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, usingKey, channel.GetAutoBan()), newAPIError)
+		summary.Disabled++
+	}
+
+	if result.localErr == nil && shouldEnableAfterTest(channel, forceKeyIndex, isChannelEnabled, channel.Status, newAPIError, usingKey) {
+		service.EnableChannel(channel.Id, usingKey, channel.Name)
+		summary.Enabled++
+	}
+
+	channel.UpdateResponseTime(milliseconds)
+	if common.RequestInterval > 0 {
+		if ctx == nil {
+			time.Sleep(common.RequestInterval)
+		} else {
+			select {
+			case <-ctx.Done():
+			case <-time.After(common.RequestInterval):
+			}
+		}
 	}
 	return summary
 }
