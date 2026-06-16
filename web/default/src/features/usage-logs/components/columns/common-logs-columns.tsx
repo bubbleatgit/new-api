@@ -77,6 +77,13 @@ function formatRatioCompact(ratio: number | undefined): string {
     : ratio.toFixed(4).replace(/\.?0+$/, '')
 }
 
+function formatKeyIndexLabel(keyIndex?: number): string | null {
+  if (keyIndex == null || !Number.isFinite(keyIndex) || keyIndex < 0) {
+    return null
+  }
+  return `#${keyIndex + 1} (index ${keyIndex})`
+}
+
 function getGroupRatioText(other: LogOtherData | null): string | null {
   const userGroupRatio = other?.user_group_ratio
   if (
@@ -334,6 +341,7 @@ export function useCommonLogsColumns(isAdmin: boolean): ColumnDef<UsageLog>[] {
             ? `${log.channel_name} #${log.channel}`
             : `#${log.channel}`
           const channelIdDisplay = `#${log.channel}`
+          const affinityKeyDisplay = formatKeyIndexLabel(affinity?.key_index)
           const channelName = sensitiveVisible ? log.channel_name : '••••'
           const multiKeyIndex = other?.admin_info?.multi_key_index
           const showMultiKeyIndex =
@@ -414,6 +422,8 @@ export function useCommonLogsColumns(isAdmin: boolean): ColumnDef<UsageLog>[] {
                               '',
                             key_hint: affinity.key_hint || '',
                             key_fp: affinity.key_fp || '',
+                            channel_id: affinity.channel_id,
+                            key_index: affinity.key_index,
                           })
                           setAffinityDialogOpen(true)
                         }}
@@ -457,6 +467,11 @@ export function useCommonLogsColumns(isAdmin: boolean): ColumnDef<UsageLog>[] {
                               '-'
                             : '••••'}
                         </p>
+                        {affinityKeyDisplay && (
+                          <p>
+                            {t('Channel key')}: {affinityKeyDisplay}
+                          </p>
+                        )}
                       </div>
                     )}
                   </div>
