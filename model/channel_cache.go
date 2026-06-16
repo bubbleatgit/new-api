@@ -268,21 +268,66 @@ func CacheUpdateChannelStatus(id int, status int) {
 	}
 	channelSyncLock.Lock()
 	defer channelSyncLock.Unlock()
-	if channel, ok := channelsIDM[id]; ok {
-		channel.Status = status
+	channel, ok := channelsIDM[id]
+	if !ok {
+		return
 	}
+	channel.Status = status
 	if status != common.ChannelStatusEnabled {
-		// delete the channel from group2model2channels
-		for group, model2channels := range group2model2channels {
-			for model, channels := range model2channels {
-				for i, channelId := range channels {
-					if channelId == id {
-						// remove the channel from the slice
-						group2model2channels[group][model] = append(channels[:i], channels[i+1:]...)
-						break
-					}
-				}
+		removeChannelFromCacheIndex(id)
+		return
+	}
+	addChannelToCacheIndex(channel)
+}
+
+func removeChannelFromCacheIndex(id int) {
+	for group, model2channels := range group2model2channels {
+		for model, channels := range model2channels {
+			group2model2channels[group][model] = removeChannelID(channels, id)
+		}
+	}
+}
+
+func removeChannelID(channels []int, id int) []int {
+	for i := 0; i < len(channels); i++ {
+		if channels[i] == id {
+			channels = append(channels[:i], channels[i+1:]...)
+			i--
+		}
+	}
+	return channels
+}
+
+func addChannelToCacheIndex(channel *Channel) {
+	if channel == nil || group2model2channels == nil {
+		return
+	}
+	groups := strings.Split(channel.Group, ",")
+	models := strings.Split(channel.Models, ",")
+	for _, group := range groups {
+		group = strings.TrimSpace(group)
+		if group == "" {
+			continue
+		}
+		if group2model2channels[group] == nil {
+			group2model2channels[group] = make(map[string][]int)
+		}
+		for _, model := range models {
+			model = strings.TrimSpace(model)
+			if model == "" {
+				continue
 			}
+			channels := removeChannelID(group2model2channels[group][model], channel.Id)
+			channels = append(channels, channel.Id)
+			sort.Slice(channels, func(i, j int) bool {
+				left := channelsIDM[channels[i]]
+				right := channelsIDM[channels[j]]
+				if left == nil || right == nil {
+					return channels[i] < channels[j]
+				}
+				return left.GetPriority() > right.GetPriority()
+			})
+			group2model2channels[group][model] = channels
 		}
 	}
 }
