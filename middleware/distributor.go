@@ -424,7 +424,7 @@ func getTaskOriginModelName(c *gin.Context) string {
 	return ""
 }
 
-func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, modelName string) *types.NewAPIError {
+func setupContextForChannel(c *gin.Context, channel *model.Channel, modelName string) *types.NewAPIError {
 	c.Set("original_model", modelName) // for retry
 	if channel == nil {
 		return types.NewError(errors.New("channel is nil"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
@@ -448,49 +448,36 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	common.SetContextKey(c, constant.ContextKeyChannelAutoBan, channel.GetAutoBan())
 	common.SetContextKey(c, constant.ContextKeyChannelModelMapping, channel.GetModelMapping())
 	common.SetContextKey(c, constant.ContextKeyChannelStatusCodeMapping, channel.GetStatusCodeMapping())
+	return nil
+}
 
+func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, modelName string) *types.NewAPIError {
+	if newAPIError := setupContextForChannel(c, channel, modelName); newAPIError != nil {
+		return newAPIError
+	}
 	key, index, newAPIError := channel.GetNextEnabledKey()
 	if newAPIError != nil {
 		return newAPIError
 	}
-	if channel.ChannelInfo.IsMultiKey {
-		common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, true)
-		common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, index)
-	} else {
-		// 必须设置为 false，否则在重试到单个 key 的时候会导致日志显示错误
-		common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, false)
+	setupContextForChannelKey(c, channel, key, index)
+	return nil
+}
+
+func SetupContextForForcedChannelKey(c *gin.Context, channel *model.Channel, modelName string, key string, keyIndex int) *types.NewAPIError {
+	if newAPIError := setupContextForChannel(c, channel, modelName); newAPIError != nil {
+		return newAPIError
 	}
-	// c.Request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", key))
-	common.SetContextKey(c, constant.ContextKeyChannelKey, key)
-	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, channel.GetBaseURL())
-
-	common.SetContextKey(c, constant.ContextKeySystemPromptOverride, false)
-
-	// TODO: api_version统一
-	switch channel.Type {
-	case constant.ChannelTypeAzure:
-		c.Set("api_version", channel.Other)
-	case constant.ChannelTypeVertexAi:
-		c.Set("region", channel.Other)
-	case constant.ChannelTypeXunfei:
-		c.Set("api_version", channel.Other)
-	case constant.ChannelTypeGemini:
-		c.Set("api_version", channel.Other)
-	case constant.ChannelTypeAli:
-		c.Set("plugin", channel.Other)
-	case constant.ChannelCloudflare:
-		c.Set("api_version", channel.Other)
-	case constant.ChannelTypeMokaAI:
-		c.Set("api_version", channel.Other)
-		case constant.ChannelTypeCoze:
-			c.Set("bot_id", channel.Other)
-		}
-		return nil
+	setupContextForChannelKey(c, channel, key, keyIndex)
+	return nil
 }
 
 // SetupContextForForcedKey 在已强制选定 key 后，补做 SetupContextForSelectedChannel 因选 key 失败短路而跳过的 context 设置。
 // 仅用于探活强制测试指定 key（包括被禁用的 key）的场景，不影响 relay 主分发路径。
 func SetupContextForForcedKey(c *gin.Context, channel *model.Channel, key string, keyIndex int) {
+	setupContextForChannelKey(c, channel, key, keyIndex)
+}
+
+func setupContextForChannelKey(c *gin.Context, channel *model.Channel, key string, keyIndex int) {
 	if channel.ChannelInfo.IsMultiKey {
 		common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, true)
 		common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, keyIndex)

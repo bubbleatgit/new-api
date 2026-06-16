@@ -86,8 +86,9 @@ func TestResolveChannelTestUserIDUsesRequestUser(t *testing.T) {
 
 // TestShouldEnableAfterTest 覆盖探活后“是否恢复”的关键决策分支。
 // 该决策是本次修复多 key 渠道无法自动恢复的核心：
-//   - 多 key（forceKeyIndex>=0）：只要探测成功+开关开+有 key 即恢复（打通“部分 key 挂掉”场景）
+//   - 多 key（forceKeyIndex>=0）：探测成功+开关开+目标 key 是自动禁用时恢复（打通“部分 key 挂掉”场景）
 //   - 单 key（forceKeyIndex<0）：仅渠道整体 AutoDisabled 且探测成功才恢复（保持原有行为）
+//
 // TestShouldProbeMultiKey 验证多 key 渠道探活的 key 过滤逻辑。
 // 核心语义：手动禁用的 key(2)绝不探活/恢复，自动禁用的 key(3)参与探活以便恢复。
 func TestShouldProbeMultiKey(t *testing.T) {
@@ -155,80 +156,100 @@ func TestShouldEnableAfterTest(t *testing.T) {
 	)
 
 	cases := []struct {
-		name           string
-		enableSwitch   bool
-		forceKeyIndex  int
-		isChannelOn    bool
-		channelStatus  int
-		err            *types.NewAPIError
-		usingKey       string
-		want           bool
+		name          string
+		enableSwitch  bool
+		forceKeyIndex int
+		isChannelOn   bool
+		channelStatus int
+		keyStatusList map[int]int
+		err           *types.NewAPIError
+		usingKey      string
+		want          bool
 	}{
 		// —— 总开关关闭：任何场景都不恢复 ——
 		{
-			name: "switch off blocks everything even multi-key success",
+			name:         "switch off blocks everything even multi-key success",
 			enableSwitch: false, forceKeyIndex: 0, isChannelOn: true,
-			channelStatus: common.ChannelStatusEnabled, usingKey: "k1",
+			channelStatus: common.ChannelStatusEnabled,
+			keyStatusList: map[int]int{0: common.ChannelStatusAutoDisabled}, usingKey: "k1",
 			want: false,
 		},
 
 		// —— 多 key 路径（forceKeyIndex >= 0）——
 		{
-			name: "multi-key: disabled key probe success -> recover",
+			name:         "multi-key: disabled key probe success -> recover",
 			enableSwitch: true, forceKeyIndex: 0, isChannelOn: true,
-			channelStatus: common.ChannelStatusEnabled, usingKey: "k1",
+			channelStatus: common.ChannelStatusEnabled,
+			keyStatusList: map[int]int{0: common.ChannelStatusAutoDisabled}, usingKey: "k1",
 			want: true,
 		},
 		{
-			name: "multi-key: probe failed -> no recover",
+			name:         "multi-key: probe failed -> no recover",
 			enableSwitch: true, forceKeyIndex: 1, isChannelOn: true,
-			channelStatus: common.ChannelStatusEnabled, err: someErr, usingKey: "k2",
+			channelStatus: common.ChannelStatusEnabled,
+			keyStatusList: map[int]int{1: common.ChannelStatusAutoDisabled}, err: someErr, usingKey: "k2",
 			want: false,
 		},
 		{
-			name: "multi-key: empty usingKey -> no recover",
+			name:         "multi-key: empty usingKey -> no recover",
 			enableSwitch: true, forceKeyIndex: 0, isChannelOn: true,
-			channelStatus: common.ChannelStatusEnabled, usingKey: "",
+			channelStatus: common.ChannelStatusEnabled,
+			keyStatusList: map[int]int{0: common.ChannelStatusAutoDisabled}, usingKey: "",
+			want: false,
+		},
+		{
+			name:         "multi-key: enabled key success -> no recover notification",
+			enableSwitch: true, forceKeyIndex: 0, isChannelOn: true,
+			channelStatus: common.ChannelStatusEnabled, keyStatusList: nil, usingKey: "k1",
+			want: false,
+		},
+		{
+			name:         "multi-key: manually disabled key success -> no recover",
+			enableSwitch: true, forceKeyIndex: 0, isChannelOn: true,
+			channelStatus: common.ChannelStatusEnabled,
+			keyStatusList: map[int]int{0: common.ChannelStatusManuallyDisabled}, usingKey: "k1",
 			want: false,
 		},
 		// 关键：即使渠道整体仍是 Enabled（部分 key 挂掉），单 key 探测成功也要恢复。
 		// 这是修复“死路 A”的核心断言——service.ShouldEnableChannel 在此场景会返回 false，
 		// 故多 key 路径必须绕开它，本测试即锁定该行为。
 		{
-			name: "multi-key: recover individual key while channel still Enabled",
+			name:         "multi-key: recover individual key while channel still Enabled",
 			enableSwitch: true, forceKeyIndex: 0, isChannelOn: true,
-			channelStatus: common.ChannelStatusEnabled, usingKey: "k1",
+			channelStatus: common.ChannelStatusEnabled,
+			keyStatusList: map[int]int{0: common.ChannelStatusAutoDisabled}, usingKey: "k1",
 			want: true,
 		},
 		// 渠道整体 AutoDisabled（所有 key 挂掉后），逐 key 探测成功也要恢复该 key（“死路 B”）。
 		{
-			name: "multi-key: recover key when channel AutoDisabled",
+			name:         "multi-key: recover key when channel AutoDisabled",
 			enableSwitch: true, forceKeyIndex: 0, isChannelOn: false,
-			channelStatus: common.ChannelStatusAutoDisabled, usingKey: "k1",
+			channelStatus: common.ChannelStatusAutoDisabled,
+			keyStatusList: map[int]int{0: common.ChannelStatusAutoDisabled}, usingKey: "k1",
 			want: true,
 		},
 
 		// —— 单 key 路径（forceKeyIndex < 0）——沿用原有 ShouldEnableChannel 语义 ——
 		{
-			name: "single-key: AutoDisabled + success -> recover",
+			name:         "single-key: AutoDisabled + success -> recover",
 			enableSwitch: true, forceKeyIndex: -1, isChannelOn: false,
 			channelStatus: common.ChannelStatusAutoDisabled, usingKey: "only-key",
 			want: true,
 		},
 		{
-			name: "single-key: AutoDisabled but probe failed -> no recover",
+			name:         "single-key: AutoDisabled but probe failed -> no recover",
 			enableSwitch: true, forceKeyIndex: -1, isChannelOn: false,
 			channelStatus: common.ChannelStatusAutoDisabled, err: someErr, usingKey: "only-key",
 			want: false,
 		},
 		{
-			name: "single-key: channel still enabled -> no recover (nothing to recover)",
+			name:         "single-key: channel still enabled -> no recover (nothing to recover)",
 			enableSwitch: true, forceKeyIndex: -1, isChannelOn: true,
 			channelStatus: common.ChannelStatusEnabled, usingKey: "only-key",
 			want: false,
 		},
 		{
-			name: "single-key: ManuallyDisabled never auto-recovered",
+			name:         "single-key: ManuallyDisabled never auto-recovered",
 			enableSwitch: true, forceKeyIndex: -1, isChannelOn: false,
 			channelStatus: common.ChannelStatusManuallyDisabled, usingKey: "only-key",
 			want: false,
@@ -238,7 +259,13 @@ func TestShouldEnableAfterTest(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			common.AutomaticEnableChannelEnabled = tc.enableSwitch
-			got := shouldEnableAfterTest(tc.forceKeyIndex, tc.isChannelOn, tc.channelStatus, tc.err, tc.usingKey)
+			channel := &model.Channel{
+				ChannelInfo: model.ChannelInfo{
+					IsMultiKey:         tc.forceKeyIndex >= 0,
+					MultiKeyStatusList: tc.keyStatusList,
+				},
+			}
+			got := shouldEnableAfterTest(channel, tc.forceKeyIndex, tc.isChannelOn, tc.channelStatus, tc.err, tc.usingKey)
 			require.Equal(t, tc.want, got)
 		})
 	}

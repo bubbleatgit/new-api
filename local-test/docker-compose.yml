@@ -2,6 +2,9 @@ name: new-api-local-test
 
 services:
   new-api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
     image: new-api:local-test
     container_name: new-api-local-test
     restart: unless-stopped

@@ -638,10 +638,33 @@ func CleanupChannelPollingLocks() {
 	})
 }
 
-func handlerMultiKeyUpdate(channel *Channel, usingKey string, status int, reason string) {
+func handlerMultiKeyUpdate(channel *Channel, usingKey string, status int, reason string) bool {
+	changed := false
 	keys := channel.GetKeys()
 	if len(keys) == 0 {
+		if channel.Status != status {
+			changed = true
+		}
 		channel.Status = status
+		if status == common.ChannelStatusEnabled {
+			info := channel.GetOtherInfo()
+			if _, exists := info["status_reason"]; exists {
+				delete(info, "status_reason")
+				changed = true
+			}
+			if _, exists := info["status_time"]; exists {
+				delete(info, "status_time")
+				changed = true
+			}
+			channel.SetOtherInfo(info)
+		} else {
+			info := channel.GetOtherInfo()
+			info["status_reason"] = reason
+			info["status_time"] = common.GetTimestamp()
+			channel.SetOtherInfo(info)
+			changed = true
+		}
+		return changed
 	} else {
 		keyIndex := -1
 		for i, key := range keys {
@@ -653,21 +676,59 @@ func handlerMultiKeyUpdate(channel *Channel, usingKey string, status int, reason
 		if keyIndex < 0 {
 			if usingKey != "" {
 				common.SysLog(fmt.Sprintf("failed to update multi-key status: channel_id=%d, using key not found", channel.Id))
-				return
+				return false
+			}
+			if channel.Status != status {
+				changed = true
 			}
 			channel.Status = status
 			info := channel.GetOtherInfo()
-			info["status_reason"] = reason
-			info["status_time"] = common.GetTimestamp()
+			if status == common.ChannelStatusEnabled {
+				if _, exists := info["status_reason"]; exists {
+					delete(info, "status_reason")
+					changed = true
+				}
+				if _, exists := info["status_time"]; exists {
+					delete(info, "status_time")
+					changed = true
+				}
+			} else {
+				info["status_reason"] = reason
+				info["status_time"] = common.GetTimestamp()
+				changed = true
+			}
 			channel.SetOtherInfo(info)
-			return
+			return changed
 		}
-		if channel.ChannelInfo.MultiKeyStatusList == nil {
+		if channel.ChannelInfo.MultiKeyStatusList == nil && status != common.ChannelStatusEnabled {
 			channel.ChannelInfo.MultiKeyStatusList = make(map[int]int)
 		}
 		if status == common.ChannelStatusEnabled {
-			delete(channel.ChannelInfo.MultiKeyStatusList, keyIndex)
+			if channel.ChannelInfo.MultiKeyStatusList != nil {
+				if currentStatus, exists := channel.ChannelInfo.MultiKeyStatusList[keyIndex]; exists && currentStatus == common.ChannelStatusManuallyDisabled {
+					return false
+				}
+				if _, exists := channel.ChannelInfo.MultiKeyStatusList[keyIndex]; exists {
+					changed = true
+				}
+				delete(channel.ChannelInfo.MultiKeyStatusList, keyIndex)
+			}
+			if channel.ChannelInfo.MultiKeyDisabledReason != nil {
+				if _, exists := channel.ChannelInfo.MultiKeyDisabledReason[keyIndex]; exists {
+					changed = true
+				}
+				delete(channel.ChannelInfo.MultiKeyDisabledReason, keyIndex)
+			}
+			if channel.ChannelInfo.MultiKeyDisabledTime != nil {
+				if _, exists := channel.ChannelInfo.MultiKeyDisabledTime[keyIndex]; exists {
+					changed = true
+				}
+				delete(channel.ChannelInfo.MultiKeyDisabledTime, keyIndex)
+			}
 		} else {
+			if prevStatus, exists := channel.ChannelInfo.MultiKeyStatusList[keyIndex]; !exists || prevStatus != status {
+				changed = true
+			}
 			channel.ChannelInfo.MultiKeyStatusList[keyIndex] = status
 			if channel.ChannelInfo.MultiKeyDisabledReason == nil {
 				channel.ChannelInfo.MultiKeyDisabledReason = make(map[int]string)
@@ -677,17 +738,36 @@ func handlerMultiKeyUpdate(channel *Channel, usingKey string, status int, reason
 			}
 			channel.ChannelInfo.MultiKeyDisabledReason[keyIndex] = reason
 			channel.ChannelInfo.MultiKeyDisabledTime[keyIndex] = common.GetTimestamp()
+			changed = true
 		}
 		if !hasEnabledMultiKey(keys, channel.ChannelInfo.MultiKeyStatusList) {
+			if channel.Status != common.ChannelStatusAutoDisabled {
+				changed = true
+			}
 			channel.Status = common.ChannelStatusAutoDisabled
 			info := channel.GetOtherInfo()
 			info["status_reason"] = "All keys are disabled"
 			info["status_time"] = common.GetTimestamp()
 			channel.SetOtherInfo(info)
+			changed = true
 		} else if status == common.ChannelStatusEnabled {
+			if channel.Status != common.ChannelStatusEnabled {
+				changed = true
+			}
 			channel.Status = common.ChannelStatusEnabled
+			info := channel.GetOtherInfo()
+			if _, exists := info["status_reason"]; exists {
+				delete(info, "status_reason")
+				changed = true
+			}
+			if _, exists := info["status_time"]; exists {
+				delete(info, "status_time")
+				changed = true
+			}
+			channel.SetOtherInfo(info)
 		}
 	}
+	return changed
 }
 
 func hasEnabledMultiKey(keys []string, statusList map[int]int) bool {
@@ -714,13 +794,12 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
 		}
 		if channelCache.ChannelInfo.IsMultiKey {
 			// Use per-channel lock to prevent concurrent map read/write with GetNextEnabledKey
-			beforeStatus := channelCache.Status
 			pollingLock := GetChannelPollingLock(channelId)
 			pollingLock.Lock()
 			// 如果是多Key模式，更新缓存中的状态
-			handlerMultiKeyUpdate(channelCache, usingKey, status, reason)
+			changed := handlerMultiKeyUpdate(channelCache, usingKey, status, reason)
 			pollingLock.Unlock()
-			if beforeStatus != channelCache.Status {
+			if changed {
 				CacheUpdateChannelStatus(channelId, channelCache.Status)
 			}
 			//CacheUpdateChannel(channelCache)
@@ -747,7 +826,7 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
 	if err != nil {
 		return false
 	} else {
-		if channel.Status == status {
+		if !channel.ChannelInfo.IsMultiKey && channel.Status == status {
 			return false
 		}
 
@@ -756,10 +835,13 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
 			// Protect map writes with the same per-channel lock used by readers
 			pollingLock := GetChannelPollingLock(channelId)
 			pollingLock.Lock()
-			handlerMultiKeyUpdate(channel, usingKey, status, reason)
+			changed := handlerMultiKeyUpdate(channel, usingKey, status, reason)
 			pollingLock.Unlock()
 			if beforeStatus != channel.Status {
 				shouldUpdateAbilities = true
+			}
+			if !changed {
+				return false
 			}
 		} else {
 			info := channel.GetOtherInfo()

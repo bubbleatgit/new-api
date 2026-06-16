@@ -181,17 +181,8 @@ func testChannel(channel *model.Channel, testUserID int, testModel string, endpo
 	group, _ := model.GetUserGroup(testUserID, false)
 	c.Set("group", group)
 
-	newAPIError := middleware.SetupContextForSelectedChannel(c, channel, testModel)
-	if newAPIError != nil {
-		// 当强制指定 key 时，容忍 "no enabled keys" 错误（全部 key 被禁用的情况），
-		// 改为手动写入指定的 key/index 并补做后续 context 设置，让探活能测到被禁用的 key。
-		if forceKeyIndex < 0 || !channel.ChannelInfo.IsMultiKey {
-			return testResult{
-				context:     c,
-				localErr:    newAPIError,
-				newAPIError: newAPIError,
-			}
-		}
+	var newAPIError *types.NewAPIError
+	if forceKeyIndex >= 0 && channel.ChannelInfo.IsMultiKey {
 		keys := channel.GetKeys()
 		if forceKeyIndex >= len(keys) {
 			return testResult{
@@ -200,8 +191,16 @@ func testChannel(channel *model.Channel, testUserID int, testModel string, endpo
 				newAPIError: types.NewError(fmt.Errorf("force key index %d out of range (len=%d)", forceKeyIndex, len(keys)), types.ErrorCodeInvalidApiType),
 			}
 		}
-		// 补做 SetupContextForSelectedChannel 因选 key 失败短路而跳过的剩余 context 设置
-		middleware.SetupContextForForcedKey(c, channel, keys[forceKeyIndex], forceKeyIndex)
+		newAPIError = middleware.SetupContextForForcedChannelKey(c, channel, testModel, keys[forceKeyIndex], forceKeyIndex)
+	} else {
+		newAPIError = middleware.SetupContextForSelectedChannel(c, channel, testModel)
+	}
+	if newAPIError != nil {
+		return testResult{
+			context:     c,
+			localErr:    newAPIError,
+			newAPIError: newAPIError,
+		}
 	}
 
 	// Determine relay format based on endpoint type or request path
@@ -1016,27 +1015,35 @@ func shouldProbeMultiKey(channel *model.Channel, keyIndex int) bool {
 
 // shouldEnableAfterTest 判定一次探活结束后是否应当调用 EnableChannel 恢复（渠道或单个 key）。
 //
-// - 多 key 逐 key 探测路径（forceKeyIndex >= 0）：只要本次探测成功且开启了自动启用，且有实际使用的 key，
-//   就尝试恢复该 key。此时渠道整体状态可能仍是 Enabled（部分 key 挂掉的场景），
-//   service.ShouldEnableChannel 会因 status != AutoDisabled 返回 false 而漏掉单 key 恢复，
-//   因此这里单独判定，打通“被禁用的 key 探测成功后自动恢复”的链路。
-// - 单 key 路径（forceKeyIndex < 0）：沿用原有恢复判定——仅在渠道整体被自动禁用（AutoDisabled）
-//   且本次探测成功时才恢复。
+//   - 多 key 逐 key 探测路径（forceKeyIndex >= 0）：本次探测成功、开启自动启用、有实际使用的 key，
+//     且目标 key 原本是 AutoDisabled 时才恢复。此时渠道整体状态可能仍是 Enabled（部分 key 挂掉的场景），
+//     service.ShouldEnableChannel 会因 status != AutoDisabled 返回 false 而漏掉单 key 恢复。
+//   - 单 key 路径（forceKeyIndex < 0）：沿用原有恢复判定——仅在渠道整体被自动禁用（AutoDisabled）
+//     且本次探测成功时才恢复。
 //
 // 抽成纯函数便于对这一关键决策做单测覆盖。
-func shouldEnableAfterTest(forceKeyIndex int, isChannelEnabled bool, channelStatus int, newAPIError *types.NewAPIError, usingKey string) bool {
+func shouldEnableAfterTest(channel *model.Channel, forceKeyIndex int, isChannelEnabled bool, channelStatus int, newAPIError *types.NewAPIError, usingKey string) bool {
 	if !common.AutomaticEnableChannelEnabled {
 		return false
 	}
 	if forceKeyIndex >= 0 {
-		// 多 key 逐 key 路径：本次探测成功且能定位到具体 key，即可恢复该 key
-		return newAPIError == nil && usingKey != ""
+		// 多 key 逐 key路径：只自动恢复已经被系统自动禁用的 key，避免正常 key 探活成功反复触发启用通知，
+		// 也避免手动禁用的 key 被恢复。
+		return newAPIError == nil && usingKey != "" && isMultiKeyAutoDisabled(channel, forceKeyIndex)
 	}
 	// 单 key 路径：渠道整体未启用、且符合 ShouldEnableChannel 条件（status==AutoDisabled 且本次成功）
 	if isChannelEnabled {
 		return false
 	}
 	return service.ShouldEnableChannel(newAPIError, channelStatus)
+}
+
+func isMultiKeyAutoDisabled(channel *model.Channel, keyIndex int) bool {
+	if channel == nil || !channel.ChannelInfo.IsMultiKey || channel.ChannelInfo.MultiKeyStatusList == nil {
+		return false
+	}
+	status, ok := channel.ChannelInfo.MultiKeyStatusList[keyIndex]
+	return ok && status == common.ChannelStatusAutoDisabled
 }
 
 // testChannelOnce 执行一次渠道探活，并根据结果执行禁用/启用判定。
@@ -1072,7 +1079,7 @@ func testChannelOnce(channel *model.Channel, testUserID int, forceKeyIndex int, 
 	}
 
 	// enable channel
-	if shouldEnableAfterTest(forceKeyIndex, isChannelEnabled, channel.Status, newAPIError, usingKey) {
+	if shouldEnableAfterTest(channel, forceKeyIndex, isChannelEnabled, channel.Status, newAPIError, usingKey) {
 		service.EnableChannel(channel.Id, usingKey, channel.Name)
 	}
 
