@@ -72,6 +72,14 @@ export function useTopNavLinks(): TopNavLink[] {
     links.push({ title: t('Console'), href: '/dashboard' })
   }
 
+  // JLPay AI Market (external company portal; brand name is not translated)
+  links.push({
+    title: '嘉联AI市场',
+    href: 'https://ai-market.jlpay.com',
+    external: true,
+  })
+
+
   // Pricing
   const pricing = modules?.pricing
   if (pricing && typeof pricing === 'object' && pricing.enabled) {
